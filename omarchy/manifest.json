@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "chargekeeper.omarchy",
+  "name": "ChargeKeeper",
+  "version": "0.1.0",
+  "author": "ChargeKeeper contributors",
+  "license": "MIT",
+  "description": "Show and switch the battery charge mode from the bar, with AC and night automation.",
+  "kinds": ["bar-widget", "service"],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "ChargeKeeper",
+    "description": "Current charge mode, level, and automatic policy.",
+    "category": "System",
+    "aliases": ["battery", "charge", "conservation", "long life", "fast charge", "chargekeeper"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLabel": false
+    }
+  }
+}

@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# ChargeKeeper root helper. This is the only component that writes sysfs.
+#
+# It accepts a battery *name* (never a path) and a closed set of actions and
+# values. Every action validates against the live attribute, writes, and waits
+# for a matching readback. Safe under a broad sudoers rule because argv cannot
+# name an attribute or a path.
+
+set -u -o pipefail
+
+SYSFS=/sys/class/power_supply
+
+usage() {
+  cat <<'EOF'
+usage:
+  chargekeeper-helper mode BAT Fast|Standard|Long_Life
+  chargekeeper-helper limit BAT END [START]
+  chargekeeper-helper behaviour BAT auto|inhibit-charge|force-discharge
+EOF
+}
+
+fail() {
+  local code=$1
+  shift
+  printf 'chargekeeper-helper: %s\n' "$*" >&2
+  exit "$code"
+}
+
+trim() {
+  local text=$1
+  text=${text#"${text%%[![:space:]]*}"}
+  text=${text%"${text##*[![:space:]]}"}
+  printf '%s' "$text"
+}
+
+parse_bracket_list() {
+  local text=$1 token name
+  local -a tokens=()
+  LIST_ACTIVE=""
+  LIST_SUPPORTED=()
+  read -ra tokens <<< "$text"
+  for token in "${tokens[@]}"; do
+    [ -n "$token" ] || continue
+    if [[ $token == \[*\] ]]; then
+      name=${token:1:${#token}-2}
+      LIST_ACTIVE=$name
+      LIST_SUPPORTED+=("$name")
+    else
+      LIST_SUPPORTED+=("$token")
+    fi
+  done
+}
+
+list_has() {
+  local needle=$1 item
+  for item in "${LIST_SUPPORTED[@]}"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
+validate_battery() {
+  local name=$1 dir
+  # A name, not a path: no slashes, no dot components, no leading dash.
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail 2 "invalid battery name"
+  dir="$SYSFS/$name"
+  [ -d "$dir" ] || fail 3 "battery $name does not exist"
+  [ "$(trim "$(cat "$dir/type" 2>/dev/null || true)")" = "Battery" ] ||
+    fail 3 "$name is not a battery"
+  printf '%s' "$dir"
+}
+
+write_attribute() {
+  local file=$1 value=$2
+  [ -e "$file" ] || fail 3 "attribute $file is missing"
+  if ! printf '%s\n' "$value" > "$file" 2>/dev/null; then
+    fail 1 "could not write $file"
+  fi
+}
+
+wait_active() {
+  local file=$1 expected=$2 text
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    text=$(cat "$file" 2>/dev/null || true)
+    # Real drivers return the full space-separated list with the active value
+    # bracketed. A plain file (tests) returns exactly what was written.
+    [ "$(trim "$text")" = "$expected" ] && return 0
+    parse_bracket_list "$text"
+    if [ "$LIST_ACTIVE" = "$expected" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  fail 1 "readback mismatch on $file (expected active $expected)"
+}
+
+wait_value() {
+  local file=$1 expected=$2 value
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    value=$(trim "$(cat "$file" 2>/dev/null || true)")
+    if [ "$value" = "$expected" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  fail 1 "readback mismatch on $file (expected $expected)"
+}
+
+action_mode() {
+  [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+  local name=$1 mode=$2 dir file text
+  case $mode in
+    Fast|Standard|Long_Life) ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  dir=$(validate_battery "$name") || exit $?
+  file="$dir/charge_types"
+  [ -r "$file" ] || fail 3 "$name has no charge_types attribute"
+  text=$(cat "$file" 2>/dev/null || true)
+  parse_bracket_list "$text"
+  list_has "$mode" || fail 3 "$name does not offer charge mode $mode (offered: $text)"
+  write_attribute "$file" "$mode"
+  wait_active "$file" "$mode"
+  printf 'mode %s set on %s\n' "$mode" "$name"
+}
+
+percent_value() {
+  local raw=$1 value
+  # Reject non-digits and anything longer than three digits before arithmetic,
+  # so "080" is decimal 80 and a huge argument cannot overflow.
+  [[ $raw =~ ^[0-9]{1,3}$ ]] || return 1
+  value=$((10#$raw))
+  [ "$value" -le 100 ] || return 1
+  printf '%s' "$value"
+}
+
+read_percent() {
+  local file=$1 value
+  [ -r "$file" ] || return 1
+  value=$(trim "$(cat "$file" 2>/dev/null || true)")
+  percent_value "$value"
+}
+
+action_limit() {
+  [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+  local name=$1 end_raw=$2 start_raw="" dir end_file start_file
+  local end_value start_value current_start="" write_start_first=false
+  end_value=$(percent_value "$end_raw") || { usage >&2; exit 2; }
+  if [ "$#" -eq 3 ]; then
+    start_raw=$3
+    start_value=$(percent_value "$start_raw") || { usage >&2; exit 2; }
+  fi
+  dir=$(validate_battery "$name") || exit $?
+  end_file="$dir/charge_control_end_threshold"
+  [ -r "$end_file" ] || fail 3 "$name has no charge_control_end_threshold attribute"
+  if [ -n "$start_raw" ]; then
+    start_file="$dir/charge_control_start_threshold"
+    [ -e "$start_file" ] || fail 3 "$name has no charge_control_start_threshold attribute"
+    current_start=$(read_percent "$start_file" || true)
+    # Many drivers require start <= end. Lower the start first when the new end
+    # would fall below the current start; otherwise raise the end first.
+    if [ -n "$current_start" ] && [ "$end_value" -lt "$current_start" ]; then
+      write_start_first=true
+    fi
+  fi
+  if [ "$write_start_first" = "true" ]; then
+    write_attribute "$start_file" "$start_value"
+    wait_value "$start_file" "$start_value"
+    write_attribute "$end_file" "$end_value"
+    wait_value "$end_file" "$end_value"
+  else
+    write_attribute "$end_file" "$end_value"
+    wait_value "$end_file" "$end_value"
+    if [ -n "$start_raw" ]; then
+      write_attribute "$start_file" "$start_value"
+      wait_value "$start_file" "$start_value"
+    fi
+  fi
+  if [ -n "$start_raw" ]; then
+    printf 'limit %s-%s set on %s\n' "$start_value" "$end_value" "$name"
+  else
+    printf 'limit %s set on %s\n' "$end_value" "$name"
+  fi
+}
+
+action_behaviour() {
+  [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+  local name=$1 behaviour=$2 dir file text
+  case $behaviour in
+    auto|inhibit-charge|force-discharge) ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  dir=$(validate_battery "$name") || exit $?
+  file="$dir/charge_behaviour"
+  [ -r "$file" ] || fail 3 "$name has no charge_behaviour attribute"
+  text=$(cat "$file" 2>/dev/null || true)
+  parse_bracket_list "$text"
+  list_has "$behaviour" || fail 3 "$name does not offer behaviour $behaviour (offered: $text)"
+  write_attribute "$file" "$behaviour"
+  wait_active "$file" "$behaviour"
+  printf 'behaviour %s set on %s\n' "$behaviour" "$name"
+}
+
+# Test-only hook: tests point the helper at a fake tree so the real action code
+# can run without root. Both variables are required. sudo resets the
+# environment and the installed rule does not grant SETENV, so this is not
+# reachable through the sudoers entry. The path comes from the environment,
+# never from argv, and only this fixed variable is honoured.
+if [ "${CHARGEKEEPER_HELPER_TEST:-0}" = "1" ]; then
+  [ -n "${CHARGEKEEPER_TEST_SYSFS:-}" ] || fail 2 "test mode requires CHARGEKEEPER_TEST_SYSFS"
+  SYSFS=$CHARGEKEEPER_TEST_SYSFS
+  [ -d "$SYSFS" ] || fail 2 "test sysfs root is not a directory: $SYSFS"
+else
+  [ "$(id -u)" -eq 0 ] || fail 1 "must run as root"
+fi
+
+[ "$#" -ge 1 ] || { usage >&2; exit 2; }
+
+action=$1
+shift
+case $action in
+  mode) action_mode "$@" ;;
+  limit) action_limit "$@" ;;
+  behaviour) action_behaviour "$@" ;;
+  --help|-h) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac

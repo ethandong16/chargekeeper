@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shell:
+    name: Shell and policy tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install jq and shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq shellcheck
+
+      - name: Bash syntax
+        run: |
+          for file in bin/chargekeeper lib/chargekeeper-helper install.sh tests/run.sh; do
+            bash -n "$file"
+          done
+
+      - name: ShellCheck
+        run: shellcheck bin/chargekeeper lib/chargekeeper-helper install.sh
+
+      - name: Plugin manifest
+        run: |
+          jq -e '.schemaVersion == 1' omarchy/manifest.json
+          jq -e '.id == "chargekeeper.omarchy" and .version == "0.1.0"' omarchy/manifest.json
+
+      - name: Plugin tests
+        run: node --test omarchy/tests/*.test.js
+
+      - name: Tests
+        run: bash tests/run.sh

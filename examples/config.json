@@ -1,0 +1,11 @@
+{
+  "enabled": true,
+  "acMode": "Long_Life",
+  "batteryMode": "Standard",
+  "acLimit": 80,
+  "batteryLimit": 100,
+  "acDelayMinutes": 10,
+  "nightStart": "",
+  "nightEnd": "",
+  "manualMinutes": 120
+}

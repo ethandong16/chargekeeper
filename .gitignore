@@ -1,0 +1,13 @@
+# Charging state, config, and build artifacts
+/pkg/
+/src/
+/build/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+*.log
+/config.json
+/manual-until
+/state/
+/.local/
+.DS_Store

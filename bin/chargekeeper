@@ -1,0 +1,1128 @@
+#!/usr/bin/env bash
+# ChargeKeeper core CLI.
+#
+# Read-only probes use sysfs and UPower. Every write goes either through UPower's
+# EnableChargeThreshold method (unprivileged, polkit) or through the narrow root
+# helper. This script never writes sysfs directly.
+
+set -u -o pipefail
+
+VERSION=0.1.0
+SYSFS=${CHARGEKEEPER_SYSFS:-/sys/class/power_supply}
+CONFIG_PATH=${CHARGEKEEPER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/chargekeeper/config.json}
+STATE_DIR=${CHARGEKEEPER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/chargekeeper}
+HELPER=${CHARGEKEEPER_HELPER:-/usr/lib/chargekeeper/chargekeeper-helper}
+HELPER_EXPLICIT=${CHARGEKEEPER_HELPER:+1}
+UPOWER_ENABLED=${CHARGEKEEPER_UPOWER:-1}
+
+declare -A UP_OBJ=() UP_NATIVE=() UP_MODEL=()
+declare -A UP_PCT=() UP_STATE=() UP_THR_SUP=() UP_THR_EN=() UP_SETTINGS=()
+UP_COUNT=0
+
+LIST_ACTIVE=""
+LIST_SUPPORTED=()
+
+usage() {
+  cat <<'EOF'
+chargekeeper 0.1.0 - battery charge policy for Linux laptops
+
+Usage:
+  chargekeeper probe [--json]
+  chargekeeper status [--json] [--battery BATx]
+  chargekeeper mode <Fast|Standard|Long_Life> [--battery BATx]
+  chargekeeper limit <0-100> [--start N] [--battery BATx]
+  chargekeeper behaviour <auto|inhibit-charge|force-discharge> [--battery BATx]
+  chargekeeper on | off
+  chargekeeper auto --once [--dry-run] [--json]
+
+Environment:
+  CHARGEKEEPER_SYSFS       sysfs power_supply root (default /sys/class/power_supply)
+  CHARGEKEEPER_CONFIG      config path (default ~/.config/chargekeeper/config.json)
+  CHARGEKEEPER_STATE_DIR   state directory (default ~/.local/state/chargekeeper)
+  CHARGEKEEPER_HELPER      root helper (default /usr/lib/chargekeeper/chargekeeper-helper)
+  CHARGEKEEPER_UPOWER=0    disable UPower probing and writes
+  CHARGEKEEPER_NOW         epoch override for deterministic policy runs
+  CHARGEKEEPER_SUDO        privilege prefix for the helper (default "sudo -n")
+
+Exit codes: 0 ok, 1 write/verification failure, 2 usage, 3 unsupported/no backend.
+EOF
+}
+
+die() {
+  printf 'chargekeeper: %s\n' "$*" >&2
+  exit 1
+}
+
+usage_error() {
+  printf 'chargekeeper: %s\n' "$*" >&2
+  exit 2
+}
+
+unsupported() {
+  printf 'chargekeeper: %s\n' "$*" >&2
+  exit 3
+}
+
+trim() {
+  local text=$1
+  text=${text#"${text%%[![:space:]]*}"}
+  text=${text%"${text##*[![:space:]]}"}
+  printf '%s' "$text"
+}
+
+is_uint() {
+  [[ $1 =~ ^[0-9]+$ ]]
+}
+
+is_number() {
+  [[ $1 =~ ^-?[0-9]+([.][0-9]+)?$ ]]
+}
+
+current_epoch() {
+  local now
+  now=${CHARGEKEEPER_NOW:-}
+  if [ -n "$now" ]; then
+    is_uint "$now" || usage_error "CHARGEKEEPER_NOW must be an epoch"
+    printf '%s' "$now"
+    return 0
+  fi
+  date +%s
+}
+
+require_jq() {
+  command -v jq >/dev/null 2>&1 || unsupported "jq is required (declared dependency)"
+}
+
+json_list() {
+  if [ "$#" -eq 0 ]; then
+    printf '[]'
+  else
+    printf '%s\n' "$@" | jq -R . | jq -sc .
+  fi
+}
+
+# Parses "Fast Standard [Long_Life]" or "[auto] inhibit-charge force-discharge"
+# into LIST_SUPPORTED and LIST_ACTIVE. No eval, no word-splitting of paths.
+parse_bracket_list() {
+  local text=$1 token name
+  local -a tokens=()
+  LIST_ACTIVE=""
+  LIST_SUPPORTED=()
+  read -ra tokens <<< "$text"
+  for token in "${tokens[@]}"; do
+    [ -n "$token" ] || continue
+    if [[ $token == \[*\] ]]; then
+      name=${token:1:${#token}-2}
+      LIST_ACTIVE=$name
+      LIST_SUPPORTED+=("$name")
+    else
+      LIST_SUPPORTED+=("$token")
+    fi
+  done
+}
+
+list_has() {
+  local needle=$1 item
+  for item in "${LIST_SUPPORTED[@]}"; do
+    if [ "$item" = "$needle" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+list_batteries() {
+  local dir name
+  for dir in "$SYSFS"/BAT*; do
+    [ -d "$dir" ] || continue
+    name=${dir##*/}
+    if [ "$(trim "$(cat "$dir/type" 2>/dev/null || true)")" = "Battery" ]; then
+      printf '%s\n' "$name"
+    fi
+  done
+}
+
+battery_exists() {
+  local name=$1 dir="$SYSFS/$1"
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  [ -d "$dir" ] || return 1
+  [ "$(trim "$(cat "$dir/type" 2>/dev/null || true)")" = "Battery" ]
+}
+
+choose_battery() {
+  local requested=${1:-} name
+  local -a batteries=()
+  if [ -n "$requested" ]; then
+    if ! battery_exists "$requested"; then
+      printf 'chargekeeper: battery %s not found in %s\n' "$requested" "$SYSFS" >&2
+      return 3
+    fi
+    printf '%s\n' "$requested"
+    return 0
+  fi
+  mapfile -t batteries < <(list_batteries)
+  if [ "${#batteries[@]}" -eq 0 ]; then
+    printf 'chargekeeper: no battery found in %s\n' "$SYSFS" >&2
+    return 3
+  fi
+  for name in "${batteries[@]}"; do
+    if [ "$(trim "$(cat "$SYSFS/$name/present" 2>/dev/null || true)")" != "0" ]; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+  done
+  printf '%s\n' "${batteries[0]}"
+}
+
+battery_present() {
+  local value
+  value=$(trim "$(cat "$SYSFS/$1/present" 2>/dev/null || true)")
+  case $value in
+    0|no|false) printf 'false' ;;
+    *) printf 'true' ;;
+  esac
+}
+
+battery_percent() {
+  local name=$1 value
+  value=$(trim "$(cat "$SYSFS/$name/capacity" 2>/dev/null || true)")
+  if is_number "$value"; then
+    printf '%s' "$value"
+  elif [ -n "${UP_PCT[$name]:-}" ] && is_number "${UP_PCT[$name]}"; then
+    printf '%s' "${UP_PCT[$name]}"
+  else
+    printf 'null'
+  fi
+}
+
+battery_status() {
+  local name=$1 value
+  value=$(trim "$(cat "$SYSFS/$name/status" 2>/dev/null || true)")
+  if [ -z "$value" ]; then
+    value=${UP_STATE[$name]:-}
+  fi
+  printf '%s' "$value"
+}
+
+battery_model() {
+  local name=$1 value
+  value=$(trim "$(cat "$SYSFS/$name/model_name" 2>/dev/null || true)")
+  if [ -z "$value" ]; then
+    value=${UP_MODEL[$name]:-}
+  fi
+  printf '%s' "$value"
+}
+
+battery_power() {
+  local name=$1 value
+  value=$(trim "$(cat "$SYSFS/$name/power_now" 2>/dev/null || true)")
+  if is_number "$value"; then
+    printf '%s' "$value"
+  else
+    printf 'null'
+  fi
+}
+
+battery_caps_any() {
+  local dir="$SYSFS/$1"
+  [ -r "$dir/charge_types" ] && return 0
+  [ -r "$dir/charge_control_end_threshold" ] && return 0
+  [ -r "$dir/charge_control_start_threshold" ] && return 0
+  [ -r "$dir/charge_behaviour" ] && return 0
+  return 1
+}
+
+read_threshold() {
+  local file=$1 value
+  [ -r "$file" ] || return 1
+  value=$(trim "$(cat "$file" 2>/dev/null || true)")
+  is_uint "$value" || return 1
+  printf '%s' "$value"
+}
+
+threshold_json() {
+  local file=$1 supported=false value=null current=""
+  if [ -r "$file" ]; then
+    supported=true
+    if current=$(read_threshold "$file"); then
+      value=$current
+    fi
+  fi
+  # min/max stay null: the driver defines the range and step per vendor, and
+  # there is no portable way to read it. Readback catches rejected values.
+  jq -cn --argjson supported "$supported" --argjson min null \
+    --argjson max null --argjson value "$value" \
+    '{supported:$supported,min:$min,max:$max,value:$value}'
+}
+
+upower_cli_available() {
+  [ "$UPOWER_ENABLED" != "0" ] && command -v upower >/dev/null 2>&1
+}
+
+upower_bus_available() {
+  [ "$UPOWER_ENABLED" != "0" ] && command -v busctl >/dev/null 2>&1
+}
+
+upower_settings_supported() {
+  local obj=$1 value
+  if ! upower_bus_available; then
+    printf '0'
+    return 0
+  fi
+  value=$(busctl --system get-property org.freedesktop.UPower "$obj" \
+    org.freedesktop.UPower.Device ChargeThresholdSettingsSupported 2>/dev/null || true)
+  value=$(trim "$value")
+  value=${value#u }
+  if is_uint "$value"; then
+    printf '%s' "$value"
+  else
+    printf '0'
+  fi
+}
+
+load_upower() {
+  local obj line info native model pct state thr_sup thr_en value
+  UP_OBJ=()
+  UP_NATIVE=()
+  UP_MODEL=()
+  UP_PCT=()
+  UP_STATE=()
+  UP_THR_SUP=()
+  UP_THR_EN=()
+  UP_SETTINGS=()
+  UP_COUNT=0
+  upower_cli_available || return 0
+
+  while IFS= read -r obj; do
+    case $obj in
+      */battery_*) ;;
+      *) continue ;;
+    esac
+    info=$(upower -i "$obj" 2>/dev/null) || continue
+    native=""
+    model=""
+    pct=""
+    state=""
+    thr_sup="no"
+    thr_en="no"
+    while IFS= read -r line; do
+      case $line in
+        *native-path:*) native=$(trim "${line#*:}") ;;
+        *model:*) model=$(trim "${line#*:}") ;;
+        *percentage:*)
+          value=$(trim "${line#*:}")
+          pct=${value%\%}
+          ;;
+        *state:*) state=$(trim "${line#*:}") ;;
+        *charge-threshold-supported:*) value=$(trim "${line#*:}"); [ "$value" = "yes" ] && thr_sup="yes" ;;
+        *charge-threshold-enabled:*) value=$(trim "${line#*:}"); [ "$value" = "yes" ] && thr_en="yes" ;;
+      esac
+    done <<< "$info"
+    [ -n "$native" ] || continue
+    UP_OBJ[$native]=$obj
+    UP_NATIVE[$native]=$native
+    UP_MODEL[$native]=$model
+    UP_PCT[$native]=$pct
+    UP_STATE[$native]=$state
+    UP_THR_SUP[$native]=$thr_sup
+    UP_THR_EN[$native]=$thr_en
+    UP_SETTINGS[$native]=$(upower_settings_supported "$obj")
+    UP_COUNT=$((UP_COUNT + 1))
+  done < <(upower -e 2>/dev/null || true)
+}
+
+ac_online() {
+  local dir name online found=false
+  for dir in "$SYSFS"/*; do
+    [ -d "$dir" ] || continue
+    [ "$(trim "$(cat "$dir/type" 2>/dev/null || true)")" = "Mains" ] || continue
+    found=true
+    online=$(trim "$(cat "$dir/online" 2>/dev/null || true)")
+    if [ "$online" = "1" ]; then
+      printf 'true'
+      return 0
+    fi
+  done
+  if [ "$found" = "false" ] && [ "$UP_COUNT" -gt 0 ]; then
+    local obj line
+    while IFS= read -r obj; do
+      case $obj in
+        */line_power_*) ;;
+        *) continue ;;
+      esac
+      while IFS= read -r line; do
+        case $line in
+          *online:*) if [ "$(trim "${line#*:}")" = "yes" ]; then printf 'true'; return 0; fi ;;
+        esac
+      done < <(upower -i "$obj" 2>/dev/null || true)
+    done < <(upower -e 2>/dev/null || true)
+  fi
+  printf 'false'
+}
+
+detect_backend() {
+  local name up=0 sys=0
+  local -a batteries=()
+  mapfile -t batteries < <(list_batteries)
+  for name in "${batteries[@]}"; do
+    if [ -n "${UP_NATIVE[$name]:-}" ]; then
+      up=1
+    fi
+    if battery_caps_any "$name"; then
+      sys=1
+    fi
+  done
+  if [ "$up" -eq 1 ] && [ "$sys" -eq 1 ]; then
+    printf 'mixed'
+  elif [ "$up" -eq 1 ]; then
+    printf 'upower'
+  else
+    printf 'sysfs'
+  fi
+}
+
+battery_json() {
+  local name=$1 dir="$SYSFS/$1"
+  local model present percent status power
+  local modes_supported='[]' modes_active='' modes_writable=false
+  local start_json end_json behaviour_supported='[]' behaviour_active=''
+  local up_native="" up_ts=false up_te=false up_set=0
+  local text upower_json
+
+  model=$(battery_model "$name")
+  present=$(battery_present "$name")
+  percent=$(battery_percent "$name")
+  status=$(battery_status "$name")
+  power=$(battery_power "$name")
+
+  if [ -r "$dir/charge_types" ]; then
+    text=$(cat "$dir/charge_types" 2>/dev/null || true)
+    parse_bracket_list "$text"
+    modes_supported=$(json_list "${LIST_SUPPORTED[@]}")
+    modes_active=$LIST_ACTIVE
+    if [ "${#LIST_SUPPORTED[@]}" -gt 0 ]; then
+      modes_writable=true
+    fi
+  fi
+  start_json=$(threshold_json "$dir/charge_control_start_threshold")
+  end_json=$(threshold_json "$dir/charge_control_end_threshold")
+  if [ -r "$dir/charge_behaviour" ]; then
+    text=$(cat "$dir/charge_behaviour" 2>/dev/null || true)
+    parse_bracket_list "$text"
+    behaviour_supported=$(json_list "${LIST_SUPPORTED[@]}")
+    behaviour_active=$LIST_ACTIVE
+  fi
+
+  if [ -n "${UP_NATIVE[$name]:-}" ]; then
+    up_native=${UP_NATIVE[$name]}
+    [ "${UP_THR_SUP[$name]:-no}" = "yes" ] && up_ts=true
+    [ "${UP_THR_EN[$name]:-no}" = "yes" ] && up_te=true
+    up_set=${UP_SETTINGS[$name]:-0}
+  fi
+
+  upower_json=$(jq -cn --arg native "$up_native" --argjson ts "$up_ts" \
+    --argjson te "$up_te" --argjson set "$up_set" \
+    '{native_path:(if $native=="" then null else $native end),threshold_supported:$ts,threshold_enabled:$te,settings_supported:$set}')
+
+  jq -cn \
+    --arg name "$name" \
+    --arg model "$model" \
+    --argjson present "$present" \
+    --argjson percentage "$percent" \
+    --arg status "$status" \
+    --argjson power "$power" \
+    --argjson modes_supported "$modes_supported" \
+    --arg modes_active "$modes_active" \
+    --argjson modes_writable "$modes_writable" \
+    --argjson start "$start_json" \
+    --argjson end "$end_json" \
+    --argjson behaviour_supported "$behaviour_supported" \
+    --arg behaviour_active "$behaviour_active" \
+    --argjson upower "$upower_json" \
+    '{
+      name:$name,
+      model:(if $model=="" then null else $model end),
+      present:$present,
+      percentage:$percentage,
+      status:(if $status=="" then null else $status end),
+      capabilities:{
+        modes:{supported:$modes_supported,active:(if $modes_active=="" then null else $modes_active end),writable:$modes_writable},
+        start_threshold:$start,
+        end_threshold:$end,
+        behaviour:{supported:$behaviour_supported,active:(if $behaviour_active=="" then null else $behaviour_active end)}
+      },
+      upower:$upower
+    }'
+}
+
+probe_json() {
+  local backend ac name
+  local -a batteries=()
+  backend=$(detect_backend)
+  ac=$(ac_online)
+  mapfile -t batteries < <(list_batteries)
+  {
+    for name in "${batteries[@]}"; do
+      battery_json "$name"
+    done
+  } | jq -sc --arg backend "$backend" --argjson ac "$ac" \
+    '{schema:1,backend:$backend,ac_online:$ac,batteries:.}'
+}
+
+probe_human() {
+  local json=$1
+  jq -r '
+    "Backend: \(.backend)",
+    "AC online: \(if .ac_online then "yes" else "no" end)",
+    (.batteries[] |
+      "Battery: \(.name)\(if .model then " (\(.model))" else "" end)",
+      "  Present: \(if .present then "yes" else "no" end)",
+      "  Charge: \(if .percentage then "\(.percentage)%" else "unknown" end) \(.status // "")",
+      "  Modes: \(if (.capabilities.modes.supported|length)==0 then "unsupported" else "\(.capabilities.modes.supported|join(" ")) (active \(.capabilities.modes.active // "none"))" end)",
+      "  Limits: \(if .capabilities.end_threshold.supported then "\(.capabilities.end_threshold.value // "unknown")% (start \(.capabilities.start_threshold.value // "unknown")%)" else "unsupported" end)",
+      "  Behaviour: \(if (.capabilities.behaviour.supported|length)==0 then "unsupported" else "\(.capabilities.behaviour.supported|join(" ")) (active \(.capabilities.behaviour.active // "none"))" end)",
+      "  UPower: \(if .upower.native_path then "threshold=\(.upower.threshold_supported) enabled=\(.upower.threshold_enabled) settings=\(.upower.settings_supported)" else "absent" end)"
+    )' <<< "$json"
+}
+
+cmd_probe() {
+  local json=false arg json_out
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --json) json=true ;;
+      --help|-h) usage; return 0 ;;
+      *) usage_error "probe: unknown argument $arg" ;;
+    esac
+    shift
+  done
+  load_upower
+  json_out=$(probe_json)
+  if [ "$json" = "true" ]; then
+    printf '%s\n' "$json_out"
+  else
+    probe_human "$json_out"
+  fi
+}
+
+cmd_status() {
+  local json=false battery_arg="" arg json_out battery value
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --json) json=true ;;
+      --battery) [ "$#" -ge 2 ] || usage_error "status: --battery needs a name"; battery_arg=$2; shift ;;
+      --battery=*) battery_arg=${arg#*=} ;;
+      --help|-h) usage; return 0 ;;
+      *) usage_error "status: unknown argument $arg" ;;
+    esac
+    shift
+  done
+  load_upower
+  battery=$(choose_battery "$battery_arg") || exit $?
+  local backend percent status power ac mode limit behaviour
+  backend=$(detect_backend)
+  percent=$(battery_percent "$battery")
+  status=$(battery_status "$battery")
+  power=$(battery_power "$battery")
+  ac=$(ac_online)
+  mode=null
+  limit=null
+  behaviour=null
+  if [ -r "$SYSFS/$battery/charge_types" ]; then
+    parse_bracket_list "$(cat "$SYSFS/$battery/charge_types" 2>/dev/null || true)"
+    [ -n "$LIST_ACTIVE" ] && mode="\"$LIST_ACTIVE\""
+  fi
+  if value=$(read_threshold "$SYSFS/$battery/charge_control_end_threshold"); then
+    limit=$value
+  fi
+  if [ -r "$SYSFS/$battery/charge_behaviour" ]; then
+    parse_bracket_list "$(cat "$SYSFS/$battery/charge_behaviour" 2>/dev/null || true)"
+    [ -n "$LIST_ACTIVE" ] && behaviour="\"$LIST_ACTIVE\""
+  fi
+  json_out=$(jq -cn \
+    --arg battery "$battery" \
+    --argjson percent "$percent" \
+    --arg status "$status" \
+    --argjson power "$power" \
+    --argjson ac "$ac" \
+    --argjson mode "$mode" \
+    --argjson limit "$limit" \
+    --argjson behaviour "$behaviour" \
+    --arg backend "$backend" \
+    '{battery:$battery,percent:$percent,state:(if $status=="" then null else $status end),power_now:$power,ac_online:$ac,mode:$mode,limit:$limit,behaviour:$behaviour,backend:$backend}')
+  if [ "$json" = "true" ]; then
+    printf '%s\n' "$json_out"
+    return 0
+  fi
+  jq -r '
+    "Battery: \(.battery)",
+    "Charge: \(if .percent then "\(.percent)%" else "unknown" end)\(if .state then " (\(.state))" else "" end)",
+    "Power: \(if .power_now then "\(.power_now / 1000000 | . * 100 | round / 100) W" else "unknown" end)",
+    "AC: \(if .ac_online then "online" else "offline" end)",
+    "Mode: \(.mode // "unsupported")",
+    "Limit: \(if .limit then "\(.limit)%" else "unsupported" end)",
+    "Behaviour: \(.behaviour // "unsupported")",
+    "Backend: \(.backend)"' <<< "$json_out"
+}
+
+run_helper() {
+  local -a prefix=()
+  local -a argv=()
+  if [ -n "${CHARGEKEEPER_SUDO:-}" ]; then
+    read -ra prefix <<< "${CHARGEKEEPER_SUDO}"
+  elif [ "$EUID" -ne 0 ] && [ -z "$HELPER_EXPLICIT" ]; then
+    prefix=(sudo -n)
+  fi
+  if [ ! -x "$HELPER" ]; then
+    unsupported "root helper $HELPER is not executable"
+  fi
+  argv=("${prefix[@]}" "$HELPER" "$@")
+  "${argv[@]}"
+}
+
+wait_mode() {
+  local file=$1 expected=$2
+  for _ in 1 2 3 4 5; do
+    parse_bracket_list "$(cat "$file" 2>/dev/null || true)"
+    if [ "$LIST_ACTIVE" = "$expected" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+wait_value() {
+  local file=$1 expected=$2 value
+  for _ in 1 2 3 4 5; do
+    value=$(trim "$(cat "$file" 2>/dev/null || true)")
+    if [ "$value" = "$expected" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
+validate_percent() {
+  local raw=$1 value
+  # Reject non-digits and anything longer than three digits before arithmetic,
+  # so a huge argument cannot overflow and "080" is read as decimal 80.
+  [[ $raw =~ ^[0-9]{1,3}$ ]] || usage_error "limit: percentage must be an integer 0..100"
+  value=$((10#$raw))
+  if [ "$value" -gt 100 ]; then
+    usage_error "limit: percentage must be an integer 0..100"
+  fi
+  printf '%s' "$value"
+}
+
+mark_manual() {
+  local minutes until
+  load_config
+  minutes=$CFG_MANUAL_MINUTES
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  until=$(( $(current_epoch) + minutes * 60 ))
+  printf '%s\n' "$until" > "$STATE_DIR/manual-until" 2>/dev/null || true
+}
+
+cmd_mode() {
+  local battery_arg="" arg mode battery file enabled
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --battery) [ "$#" -ge 2 ] || usage_error "mode: --battery needs a name"; battery_arg=$2; shift ;;
+      --battery=*) battery_arg=${arg#*=} ;;
+      --help|-h) usage; return 0 ;;
+      -*) usage_error "mode: unknown option $arg" ;;
+      *) [ -z "${mode:-}" ] || usage_error "mode: too many arguments"; mode=$arg ;;
+    esac
+    shift
+  done
+  [ -n "${mode:-}" ] || usage_error "mode: missing charge mode"
+  case $mode in
+    Fast|Standard|Long_Life) ;;
+    *) usage_error "mode: expected Fast, Standard, or Long_Life" ;;
+  esac
+  battery=$(choose_battery "$battery_arg") || exit $?
+  file=$SYSFS/$battery/charge_types
+  [ -r "$file" ] || unsupported "$battery has no charge_types attribute"
+  parse_bracket_list "$(cat "$file" 2>/dev/null || true)"
+  list_has "$mode" || unsupported "$battery does not offer charge mode $mode"
+
+  # UPower maps enabled=true to Long_Life and false to Standard. Prefer it when
+  # it reports threshold support; Fast has no UPower verb and stays helper-only.
+  if [ "$mode" != "Fast" ]; then
+    load_upower
+    if [ -n "${UP_OBJ[$battery]:-}" ] && [ "${UP_THR_SUP[$battery]:-no}" = "yes" ] &&
+      upower_bus_available; then
+      enabled=true
+      [ "$mode" = "Standard" ] && enabled=false
+      if upower_set_enabled "$battery" "$enabled"; then
+        wait_mode "$file" "$mode" || die "readback mismatch on $file (expected $mode)"
+        mark_manual
+        printf 'Set %s charge mode to %s (UPower)\n' "$battery" "$mode"
+        return 0
+      fi
+      printf 'chargekeeper: UPower write failed; falling back to the helper\n' >&2
+    fi
+  fi
+
+  run_helper mode "$battery" "$mode" || die "helper failed to set $mode"
+  wait_mode "$file" "$mode" || die "readback mismatch on $file (expected $mode)"
+  mark_manual
+  printf 'Set %s charge mode to %s\n' "$battery" "$mode"
+}
+
+cmd_limit() {
+  local battery_arg="" start_raw="" arg end end_value start_value battery file start_file
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --battery) [ "$#" -ge 2 ] || usage_error "limit: --battery needs a name"; battery_arg=$2; shift ;;
+      --battery=*) battery_arg=${arg#*=} ;;
+      --start) [ "$#" -ge 2 ] || usage_error "limit: --start needs a percentage"; start_raw=$2; shift ;;
+      --start=*) start_raw=${arg#*=} ;;
+      --help|-h) usage; return 0 ;;
+      -*) usage_error "limit: unknown option $arg" ;;
+      *) [ -z "${end:-}" ] || usage_error "limit: too many arguments"; end=$arg ;;
+    esac
+    shift
+  done
+  [ -n "${end:-}" ] || usage_error "limit: missing percentage"
+  end_value=$(validate_percent "$end") || exit $?
+  if [ -n "$start_raw" ]; then
+    start_value=$(validate_percent "$start_raw") || exit $?
+  fi
+  battery=$(choose_battery "$battery_arg") || exit $?
+  file=$SYSFS/$battery/charge_control_end_threshold
+  [ -r "$file" ] || unsupported "$battery has no charge_control_end_threshold attribute"
+  if [ -n "$start_raw" ]; then
+    start_file=$SYSFS/$battery/charge_control_start_threshold
+    [ -r "$start_file" ] || unsupported "$battery has no charge_control_start_threshold attribute"
+    run_helper limit "$battery" "$end_value" "$start_value" || die "helper failed to set charge limit"
+  else
+    run_helper limit "$battery" "$end_value" || die "helper failed to set charge limit"
+  fi
+  wait_value "$file" "$end_value" || die "readback mismatch on $file (expected $end_value)"
+  if [ -n "$start_raw" ]; then
+    wait_value "$start_file" "$start_value" || die "readback mismatch on $start_file (expected $start_value)"
+  fi
+  mark_manual
+  if [ -n "$start_raw" ]; then
+    printf 'Set %s charge limit to %s%% (start %s%%)\n' "$battery" "$end_value" "$start_value"
+  else
+    printf 'Set %s charge limit to %s%%\n' "$battery" "$end_value"
+  fi
+}
+
+cmd_behaviour() {
+  local battery_arg="" arg target battery file
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --battery) [ "$#" -ge 2 ] || usage_error "behaviour: --battery needs a name"; battery_arg=$2; shift ;;
+      --battery=*) battery_arg=${arg#*=} ;;
+      --help|-h) usage; return 0 ;;
+      -*) usage_error "behaviour: unknown option $arg" ;;
+      *) [ -z "${target:-}" ] || usage_error "behaviour: too many arguments"; target=$arg ;;
+    esac
+    shift
+  done
+  [ -n "${target:-}" ] || usage_error "behaviour: missing value"
+  case $target in
+    auto|inhibit-charge|force-discharge) ;;
+    *) usage_error "behaviour: expected auto, inhibit-charge, or force-discharge" ;;
+  esac
+  battery=$(choose_battery "$battery_arg") || exit $?
+  file=$SYSFS/$battery/charge_behaviour
+  [ -r "$file" ] || unsupported "$battery has no charge_behaviour attribute"
+  parse_bracket_list "$(cat "$file" 2>/dev/null || true)"
+  list_has "$target" || unsupported "$battery does not offer behaviour $target"
+  run_helper behaviour "$battery" "$target" || die "helper failed to set behaviour $target"
+  wait_mode "$file" "$target" || die "readback mismatch on $file (expected $target)"
+  mark_manual
+  printf 'Set %s charge behaviour to %s\n' "$battery" "$target"
+}
+
+upower_require_device() {
+  local battery=$1
+  upower_cli_available || unsupported "UPower is unavailable"
+  upower_bus_available || unsupported "busctl is unavailable"
+  [ -n "${UP_OBJ[$battery]:-}" ] || unsupported "UPower does not expose battery $battery"
+  [ "${UP_THR_SUP[$battery]:-no}" = "yes" ] || unsupported "UPower reports no charge-threshold support for $battery"
+}
+
+upower_set_enabled() {
+  local battery=$1 expected=$2 obj value got
+  obj=${UP_OBJ[$battery]}
+  if ! busctl --system call org.freedesktop.UPower "$obj" \
+    org.freedesktop.UPower.Device EnableChargeThreshold b "$expected" >/dev/null 2>&1; then
+    printf 'chargekeeper: UPower EnableChargeThreshold failed\n' >&2
+    return 1
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    value=$(busctl --system get-property org.freedesktop.UPower "$obj" \
+      org.freedesktop.UPower.Device ChargeThresholdEnabled 2>/dev/null || true)
+    got=$(trim "$value")
+    got=${got#b }
+    if [ "$got" = "$expected" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  printf 'chargekeeper: UPower threshold readback mismatch (expected %s)\n' "$expected" >&2
+  return 1
+}
+
+cmd_on_off() {
+  local enabled=$1 battery
+  shift
+  [ "$#" -eq 0 ] || usage_error "on/off takes no arguments"
+  load_upower
+  battery=$(choose_battery "") || exit $?
+  upower_require_device "$battery"
+  upower_set_enabled "$battery" "$enabled" || die "could not set UPower charge threshold"
+  mark_manual
+  if [ "$enabled" = "true" ]; then
+    printf 'Enabled %s charge threshold (Long_Life)\n' "$battery"
+  else
+    printf 'Disabled %s charge threshold (Standard)\n' "$battery"
+  fi
+}
+
+load_config() {
+  local raw="" normalized=""
+  CFG_ENABLED=true
+  CFG_ACMODE=Long_Life
+  CFG_BATTERYMODE=Standard
+  CFG_ACLIMIT=80
+  CFG_BATTERYLIMIT=100
+  CFG_ACDELAY=10
+  CFG_NIGHTSTART=""
+  CFG_NIGHTEND=""
+  CFG_MANUAL_MINUTES=120
+
+  if [ -r "$CONFIG_PATH" ]; then
+    raw=$(cat "$CONFIG_PATH" 2>/dev/null || true)
+  fi
+  if [ -n "$raw" ] && jq -e . >/dev/null 2>&1 <<< "$raw"; then
+    normalized=$(jq -c '
+      def bool_or($d): if type=="boolean" then . else $d end;
+      def mode_or($d): if type=="string" and test("^(Fast|Standard|Long_Life)$") then . else $d end;
+      def num_or($d;$lo;$hi):
+        if type=="number" then ([$lo, ([$hi, (floor)] | min)] | max) else $d end;
+      def clock_or: if type=="string" and test("^([01]?[0-9]|2[0-3]):[0-5][0-9]$") then . else "" end;
+      (if type=="object" then . else {} end) as $c |
+      {
+        enabled: ($c.enabled | bool_or(true)),
+        acMode: ($c.acMode | mode_or("Long_Life")),
+        batteryMode: ($c.batteryMode | mode_or("Standard")),
+        acLimit: ($c.acLimit | num_or(80;0;100)),
+        batteryLimit: ($c.batteryLimit | num_or(100;0;100)),
+        acDelayMinutes: ($c.acDelayMinutes | num_or(10;0;720)),
+        nightStart: ($c.nightStart | clock_or),
+        nightEnd: ($c.nightEnd | clock_or),
+        manualMinutes: ($c.manualMinutes | num_or(120;0;1440))
+      }' <<< "$raw" 2>/dev/null || true)
+  fi
+  if [ -z "$normalized" ]; then
+    normalized='{"enabled":true,"acMode":"Long_Life","batteryMode":"Standard","acLimit":80,"batteryLimit":100,"acDelayMinutes":10,"nightStart":"","nightEnd":"","manualMinutes":120}'
+  fi
+
+  CFG_ENABLED=$(jq -r '.enabled' <<< "$normalized")
+  CFG_ACMODE=$(jq -r '.acMode' <<< "$normalized")
+  CFG_BATTERYMODE=$(jq -r '.batteryMode' <<< "$normalized")
+  CFG_ACLIMIT=$(jq -r '.acLimit' <<< "$normalized")
+  CFG_BATTERYLIMIT=$(jq -r '.batteryLimit' <<< "$normalized")
+  CFG_ACDELAY=$(jq -r '.acDelayMinutes' <<< "$normalized")
+  CFG_NIGHTSTART=$(jq -r '.nightStart' <<< "$normalized")
+  CFG_NIGHTEND=$(jq -r '.nightEnd' <<< "$normalized")
+  CFG_MANUAL_MINUTES=$(jq -r '.manualMinutes' <<< "$normalized")
+}
+
+clock_minutes() {
+  local text=$1 hours minutes
+  if ! [[ $text =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+    printf '%s' "-1"
+    return 0
+  fi
+  hours=$((10#${BASH_REMATCH[1]}))
+  minutes=$((10#${BASH_REMATCH[2]}))
+  printf '%s' "$((hours * 60 + minutes))"
+}
+
+in_window() {
+  local now=$1 start=$2 end=$3
+  if [ "$start" -lt 0 ] || [ "$end" -lt 0 ] || [ "$start" -eq "$end" ]; then
+    return 1
+  fi
+  if [ "$start" -lt "$end" ]; then
+    [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ]
+  else
+    [ "$now" -ge "$start" ] || [ "$now" -lt "$end" ]
+  fi
+}
+
+DEC_ACTION=none
+DEC_KIND=""
+DEC_TARGET=""
+DEC_REASON=""
+DEC_CURRENT=""
+DEC_BATTERY=""
+
+policy_decide() {
+  local now minutes_since_midnight night_start night_end night=false
+  local ac ac_since=0 ac_elapsed=0 manual_until=0 manual=false
+  local modes_available=false end_available=false target="" kind="" reason=""
+  local current="" supported=false
+
+  DEC_ACTION=none
+  DEC_KIND=""
+  DEC_TARGET=""
+  DEC_REASON=""
+  DEC_CURRENT=""
+  DEC_BATTERY=""
+
+  load_config
+  if [ "$CFG_ENABLED" != "true" ]; then
+    DEC_REASON=disabled
+    return 0
+  fi
+
+  DEC_BATTERY=$(choose_battery "") || exit $?
+  local battery=$DEC_BATTERY
+
+  now=$(current_epoch)
+  minutes_since_midnight=$(date -d "@$now" +%H:%M)
+  minutes_since_midnight=$((10#${minutes_since_midnight:0:2} * 60 + 10#${minutes_since_midnight:3:2}))
+  night_start=$(clock_minutes "$CFG_NIGHTSTART")
+  night_end=$(clock_minutes "$CFG_NIGHTEND")
+  if [ "$night_start" -ge 0 ] && [ "$night_end" -ge 0 ] && in_window "$minutes_since_midnight" "$night_start" "$night_end"; then
+    night=true
+  fi
+
+  if [ -r "$STATE_DIR/manual-until" ]; then
+    manual_until=$(trim "$(cat "$STATE_DIR/manual-until" 2>/dev/null || true)")
+    is_uint "$manual_until" || manual_until=0
+    if [ "$manual_until" -gt "$now" ]; then
+      manual=true
+    fi
+  fi
+  if [ "$manual" = "true" ]; then
+    DEC_REASON=manual
+    return 0
+  fi
+
+  if [ -r "$STATE_DIR/ac-since" ]; then
+    ac_since=$(trim "$(cat "$STATE_DIR/ac-since" 2>/dev/null || true)")
+    is_uint "$ac_since" || ac_since=0
+  fi
+  ac=$(ac_online)
+  if [ "$ac" = "true" ] && [ "$ac_since" -gt 0 ] && [ "$now" -ge "$ac_since" ]; then
+    ac_elapsed=$(( (now - ac_since) / 60 ))
+  else
+    ac_elapsed=0
+  fi
+
+  if [ -r "$SYSFS/$battery/charge_types" ]; then
+    parse_bracket_list "$(cat "$SYSFS/$battery/charge_types" 2>/dev/null || true)"
+    [ "${#LIST_SUPPORTED[@]}" -gt 0 ] && modes_available=true
+    current=$LIST_ACTIVE
+  fi
+  if [ -r "$SYSFS/$battery/charge_control_end_threshold" ]; then
+    end_available=true
+    if [ -z "$current" ]; then
+      current=$(read_threshold "$SYSFS/$battery/charge_control_end_threshold" || true)
+    fi
+  fi
+
+  if [ "$modes_available" = "true" ]; then
+    if [ "$night" = "true" ]; then
+      target=Long_Life
+      kind=mode
+      reason=night
+    elif [ "$ac" = "true" ]; then
+      if [ "$ac_elapsed" -lt "$CFG_ACDELAY" ]; then
+        DEC_REASON=delay
+        return 0
+      fi
+      target=$CFG_ACMODE
+      kind=mode
+      reason=ac
+    else
+      target=$CFG_BATTERYMODE
+      kind=mode
+      reason=battery
+    fi
+    parse_bracket_list "$(cat "$SYSFS/$battery/charge_types" 2>/dev/null || true)"
+    if list_has "$target"; then
+      supported=true
+    elif [ "$night" = "true" ] && [ "$end_available" = "true" ]; then
+      target=$CFG_ACLIMIT
+      kind=limit
+      reason=night
+      current=$(read_threshold "$SYSFS/$battery/charge_control_end_threshold" || true)
+      supported=true
+    fi
+  elif [ "$end_available" = "true" ]; then
+    if [ "$night" = "true" ]; then
+      target=$CFG_ACLIMIT
+      reason=night
+    elif [ "$ac" = "true" ]; then
+      if [ "$ac_elapsed" -lt "$CFG_ACDELAY" ]; then
+        DEC_REASON=delay
+        return 0
+      fi
+      target=$CFG_ACLIMIT
+      reason=ac
+    else
+      target=$CFG_BATTERYLIMIT
+      reason=battery
+    fi
+    kind=limit
+    current=$(read_threshold "$SYSFS/$battery/charge_control_end_threshold" || true)
+    supported=true
+  else
+    DEC_REASON=unsupported
+    return 0
+  fi
+
+  if [ "$supported" != "true" ]; then
+    DEC_REASON=unsupported-target
+    return 0
+  fi
+
+  DEC_CURRENT=$current
+  if [ "$current" = "$target" ]; then
+    DEC_REASON=already
+    return 0
+  fi
+  DEC_ACTION="set"
+  DEC_KIND=$kind
+  DEC_TARGET=$target
+  DEC_REASON=$reason
+}
+
+apply_policy() {
+  local battery=$1 kind=$2 target=$3
+  if [ "$kind" = "mode" ]; then
+    if { [ "$target" = "Standard" ] || [ "$target" = "Long_Life" ]; } &&
+      [ -n "${UP_OBJ[$battery]:-}" ] && [ "${UP_THR_SUP[$battery]:-no}" = "yes" ] &&
+      upower_bus_available; then
+      local enabled=true
+      [ "$target" = "Standard" ] && enabled=false
+      upower_set_enabled "$battery" "$enabled" || return 1
+      wait_mode "$SYSFS/$battery/charge_types" "$target" || {
+        printf 'chargekeeper: charge mode readback mismatch (expected %s)\n' "$target" >&2
+        return 1
+      }
+      return 0
+    fi
+    run_helper mode "$battery" "$target" || return 1
+    wait_mode "$SYSFS/$battery/charge_types" "$target" || {
+      printf 'chargekeeper: charge mode readback mismatch (expected %s)\n' "$target" >&2
+      return 1
+    }
+    return 0
+  fi
+  run_helper limit "$battery" "$target" || return 1
+  wait_value "$SYSFS/$battery/charge_control_end_threshold" "$target" || {
+    printf 'chargekeeper: charge limit readback mismatch (expected %s)\n' "$target" >&2
+    return 1
+  }
+}
+
+cmd_auto() {
+  local once=false dry=false json=false arg applied=false
+  while [ "$#" -gt 0 ]; do
+    arg=$1
+    case $arg in
+      --once) once=true ;;
+      --dry-run) dry=true ;;
+      --json) json=true ;;
+      --help|-h) usage; return 0 ;;
+      *) usage_error "auto: unknown argument $arg" ;;
+    esac
+    shift
+  done
+  if [ "$once" != "true" ] && [ "$dry" != "true" ]; then
+    usage_error "auto: --once is required"
+  fi
+  require_jq
+  load_upower
+
+  local now
+  now=$(current_epoch)
+  if [ "$dry" != "true" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    if [ "$(ac_online)" = "true" ]; then
+      if [ ! -r "$STATE_DIR/ac-since" ] || ! is_uint "$(trim "$(cat "$STATE_DIR/ac-since" 2>/dev/null || true)")"; then
+        printf '%s\n' "$now" > "$STATE_DIR/ac-since" 2>/dev/null || true
+      fi
+    else
+      rm -f "$STATE_DIR/ac-since" 2>/dev/null || true
+    fi
+  fi
+
+  policy_decide
+  local backend
+  backend=$(detect_backend)
+
+  if [ "$DEC_ACTION" = "set" ] && [ "$dry" != "true" ]; then
+    apply_policy "$DEC_BATTERY" "$DEC_KIND" "$DEC_TARGET" || die "failed to apply ${DEC_KIND} ${DEC_TARGET}"
+    applied=true
+  fi
+
+  if [ "$json" = "true" ]; then
+    jq -cn \
+      --arg action "$DEC_ACTION" \
+      --arg kind "$DEC_KIND" \
+      --arg target "$DEC_TARGET" \
+      --arg reason "$DEC_REASON" \
+      --arg current "$DEC_CURRENT" \
+      --arg battery "$DEC_BATTERY" \
+      --arg backend "$backend" \
+      --argjson applied "$applied" \
+      --argjson dry "$dry" \
+      '{action:$action,target:(if $target=="" then null elif $kind=="limit" then ($target|tonumber) else $target end),reason:$reason,kind:(if $kind=="" then null else $kind end),current:(if $current=="" then null elif $kind=="limit" then ($current|tonumber) else $current end),battery:(if $battery=="" then null else $battery end),backend:$backend,applied:$applied,dry_run:$dry}'
+    return 0
+  fi
+
+  if [ "$DEC_ACTION" = "set" ]; then
+    if [ "$dry" = "true" ]; then
+      printf 'would set %s %s (reason: %s)\n' "$DEC_KIND" "$DEC_TARGET" "$DEC_REASON"
+    else
+      printf 'set %s %s (reason: %s)\n' "$DEC_KIND" "$DEC_TARGET" "$DEC_REASON"
+    fi
+  else
+    printf 'no change (reason: %s)\n' "$DEC_REASON"
+  fi
+}
+
+main() {
+  [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+  local subcommand=$1
+  shift
+  case $subcommand in
+    --help|-h) usage; exit 0 ;;
+    --version|-V) printf 'chargekeeper %s\n' "$VERSION"; exit 0 ;;
+  esac
+  require_jq
+  if [ -n "${CHARGEKEEPER_NOW:-}" ] && ! is_uint "$CHARGEKEEPER_NOW"; then
+    usage_error "CHARGEKEEPER_NOW must be an epoch"
+  fi
+  case $subcommand in
+    probe) cmd_probe "$@" ;;
+    status) cmd_status "$@" ;;
+    mode) cmd_mode "$@" ;;
+    limit) cmd_limit "$@" ;;
+    behaviour|behavior) cmd_behaviour "$@" ;;
+    on) cmd_on_off true "$@" ;;
+    off) cmd_on_off false "$@" ;;
+    auto) cmd_auto "$@" ;;
+    *) usage_error "unknown command $subcommand" ;;
+  esac
+}
+
+main "$@"

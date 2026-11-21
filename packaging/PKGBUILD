@@ -1,0 +1,81 @@
+# Maintainer: ChargeKeeper contributors
+pkgname=chargekeeper-git
+pkgver=0.1.0.r0
+pkgrel=1
+pkgdesc="Battery charge-policy tool for Linux laptops (CLI, root helper, Omarchy plugin)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ethandong16/chargekeeper"
+license=('MIT')
+depends=('bash' 'jq' 'upower')
+makedepends=('git')
+provides=('chargekeeper')
+conflicts=('chargekeeper')
+options=('!strip')
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/chargekeeper" || return 1
+
+  local desc
+  if desc=$(git describe --long --tags --abbrev=7 2>/dev/null); then
+    printf '%s' "$desc" | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  else
+    printf '0.1.0.r0'
+  fi
+}
+
+package() {
+  cd "$srcdir/chargekeeper" || return 1
+
+  install -Dm755 bin/chargekeeper "$pkgdir/usr/bin/chargekeeper"
+  install -Dm755 lib/chargekeeper-helper "$pkgdir/usr/lib/chargekeeper/chargekeeper-helper"
+
+  install -d "$pkgdir/usr/share/chargekeeper"
+  cp -a omarchy "$pkgdir/usr/share/chargekeeper/omarchy"
+
+  install -d "$pkgdir/usr/share/doc/chargekeeper"
+  install -m0644 README.md LICENSE CHANGELOG.md "$pkgdir/usr/share/doc/chargekeeper/"
+  cp -a docs "$pkgdir/usr/share/doc/chargekeeper/docs"
+  install -m0644 examples/config.json "$pkgdir/usr/share/doc/chargekeeper/config.example.json"
+
+  install -Dm0644 systemd/user/chargekeeper-auto.service \
+    "$pkgdir/usr/lib/systemd/user/chargekeeper-auto.service"
+  install -Dm0644 systemd/user/chargekeeper-auto.timer \
+    "$pkgdir/usr/lib/systemd/user/chargekeeper-auto.timer"
+}
+
+post_install() {
+  cat <<'EOF'
+ChargeKeeper installed.
+
+Probe the hardware:
+  chargekeeper probe
+
+Fast mode and numeric charge limits need the root helper installed at
+/usr/lib/chargekeeper/chargekeeper-helper. The package installs the helper but
+NOT a sudoers rule. To let the wheel group use it:
+
+  echo '%wheel ALL=(root) NOPASSWD: /usr/lib/chargekeeper/chargekeeper-helper' \
+    | sudo tee /etc/sudoers.d/chargekeeper >/dev/null
+  sudo chmod 0440 /etc/sudoers.d/chargekeeper
+  sudo visudo -cf /etc/sudoers.d/chargekeeper
+
+ChargeKeeper 0.1.0 has no 'chargekeeper setup-helper' subcommand; use the
+commands above, or run ./install.sh --with-helper from a source checkout.
+
+The helper validates every request (battery name, offered mode, numeric range,
+charge_behaviour value) and verifies the readback.
+
+Enable the automatic policy timer per user:
+  systemctl --user daemon-reload
+  systemctl --user enable --now chargekeeper-auto.timer
+
+Omarchy bar plugin (source is /usr/share/chargekeeper/omarchy):
+  mkdir -p ~/.config/omarchy/plugins
+  cp -a /usr/share/chargekeeper/omarchy ~/.config/omarchy/plugins/chargekeeper.omarchy
+  omarchy plugin enable chargekeeper.omarchy --section right
+
+Read /usr/share/doc/chargekeeper/README.md and docs/capabilities.md first.
+EOF
+}

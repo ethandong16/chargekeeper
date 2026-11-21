@@ -1,0 +1,6 @@
+[Unit]
+Description=ChargeKeeper automatic charge policy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/chargekeeper auto --once
