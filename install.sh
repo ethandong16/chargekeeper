@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.1.1"
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SRC_DIR
 
@@ -28,9 +28,9 @@ usage() {
 Usage: ./install.sh [--with-helper] [--uninstall]
 
   (no options)   Install the CLI to ~/.local/bin, the Omarchy plugin to
-                 ~/.config/omarchy/plugins/chargekeeper.omarchy, the systemd
-                 user units to ~/.config/systemd/user, and an example config
-                 to ~/.config/chargekeeper/config.json if absent.
+                 ~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper,
+                 the systemd user units to ~/.config/systemd/user, and an
+                 example config to ~/.config/chargekeeper/config.json if absent.
   --with-helper  Also install the root helper (0755 root:root) and a
                  /etc/sudoers.d/chargekeeper rule, validated with visudo.
                  Needs sudo.
@@ -65,7 +65,7 @@ done
 [[ -n ${HOME:-} ]] || fail "HOME is not set"
 
 readonly BIN_DEST="${HOME}/.local/bin/chargekeeper"
-readonly PLUGIN_DEST="${HOME}/.config/omarchy/plugins/chargekeeper.omarchy"
+readonly PLUGIN_DEST="${HOME}/.config/omarchy/plugins/io.github.ethandong16.chargekeeper"
 readonly UNIT_DEST="${HOME}/.config/systemd/user"
 readonly CONFIG_DIR="${HOME}/.config/chargekeeper"
 readonly CONFIG_DEST="${CONFIG_DIR}/config.json"
@@ -81,8 +81,12 @@ require_sources() {
     [[ -f "${SRC_DIR}/${file}" ]] \
       || fail "missing ${file}; run install.sh from the ChargeKeeper repository root"
   done
-  [[ -f "${SRC_DIR}/omarchy/manifest.json" ]] \
-    || fail "missing omarchy/manifest.json; run install.sh from the repository root"
+  for file in manifest.json Panel.qml Service.qml Model.js Policy.js \
+    i18n/en.json i18n/zh-CN.json
+  do
+    [[ -f "${SRC_DIR}/${file}" ]] \
+      || fail "missing ${file}; run install.sh from the ChargeKeeper repository root"
+  done
   if ((with_helper)); then
     [[ -f "${SRC_DIR}/lib/chargekeeper-helper" ]] \
       || fail "missing lib/chargekeeper-helper; run install.sh from the repository root"
@@ -125,8 +129,21 @@ install_user() {
     "${HOME}/.config/omarchy/plugins"
   install -m 0755 "${SRC_DIR}/bin/chargekeeper" "${BIN_DEST}"
 
-  rm -rf -- "${PLUGIN_DEST}"
-  cp -a -- "${SRC_DIR}/omarchy" "${PLUGIN_DEST}"
+  if [[ "$(cd -- "${SRC_DIR}" && pwd -P)" == "$(cd -- "${PLUGIN_DEST}" 2>/dev/null && pwd -P)" ]]; then
+    # Installed with `omarchy plugin add`: the plugin folder is this checkout.
+    note "plugin already installed in place: ${PLUGIN_DEST}"
+  else
+    rm -rf -- "${PLUGIN_DEST}"
+    install -d -m 0755 "${PLUGIN_DEST}" "${PLUGIN_DEST}/i18n"
+    install -m 0644 \
+      "${SRC_DIR}/manifest.json" \
+      "${SRC_DIR}/Panel.qml" \
+      "${SRC_DIR}/Service.qml" \
+      "${SRC_DIR}/Model.js" \
+      "${SRC_DIR}/Policy.js" \
+      "${PLUGIN_DEST}/"
+    install -m 0644 "${SRC_DIR}/i18n/"*.json "${PLUGIN_DEST}/i18n/"
+  fi
 
   # The packaged units use /usr/bin/chargekeeper; the user-local CLI is under
   # ~/.local/bin, so rewrite ExecStart in the installed copy.
@@ -204,7 +221,7 @@ note "  config: ${CONFIG_DEST}"
 note ""
 note "Check the hardware: chargekeeper probe"
 note "Enable automation: systemctl --user enable --now chargekeeper-auto.timer"
-note "Enable the bar widget: omarchy plugin enable chargekeeper.omarchy --section right"
+note "Enable the bar widget: omarchy plugin enable io.github.ethandong16.chargekeeper --section right"
 case ":${PATH}:" in
   *":${HOME}/.local/bin:"*) ;;
   *) note "Add ${HOME}/.local/bin to PATH if the chargekeeper command is not found." ;;

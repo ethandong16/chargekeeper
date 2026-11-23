@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict")
 const test = require("node:test")
-const Policy = require("../Policy.js")
+const Policy = require("../../Policy.js")
 
 function config(extra) {
   return Policy.normalizeConfig(Object.assign({}, extra || {}))

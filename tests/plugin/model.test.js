@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict")
 const test = require("node:test")
-const Model = require("../Model.js")
+const Model = require("../../Model.js")
 
 test("reads the active charge mode from the bracketed token", () => {
   assert.deepEqual(Model.parseChargeTypes("Fast [Standard] Long_Life\n"), {
