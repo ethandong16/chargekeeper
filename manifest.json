@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "chargekeeper.omarchy",
+  "id": "io.github.ethandong16.chargekeeper",
   "name": "ChargeKeeper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "ChargeKeeper contributors",
   "license": "MIT",
-  "description": "Show and switch the battery charge mode from the bar, with AC and night automation.",
+  "description": "Show and switch the firmware charge mode (Fast, Standard, Long life) from the Omarchy bar, with AC and night automation.",
   "kinds": ["bar-widget", "service"],
   "entryPoints": {
     "barWidget": "Panel.qml",

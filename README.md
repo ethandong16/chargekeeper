@@ -43,7 +43,58 @@ handles the unprivileged threshold path.
 
 Requirements: Linux, bash 5, `jq`, UPower (for `on`/`off`, the
 `Standard`/`Long_Life` preference, and device state), and a kernel driver that
-exposes the battery attributes. Omarchy is optional.
+exposes the battery attributes. The Omarchy plugin also needs Omarchy's
+Quickshell shell; the CLI runs without Omarchy.
+
+### Omarchy plugin
+
+The repository root is the plugin folder: `manifest.json`, `Panel.qml`,
+`Service.qml`, `Model.js`, `Policy.js`, and `i18n/`. Omarchy can add the widget
+straight from this repository:
+
+```bash
+omarchy plugin add https://github.com/ethandong16/chargekeeper --enable
+omarchy restart shell
+```
+
+The plugin ID is `io.github.ethandong16.chargekeeper`. `Standard` and
+`Long_Life` switch through UPower without a password. `Fast`, the numeric
+limit commands, and `charge_behaviour` need the root helper, which the CLI also
+uses; install it once from a checkout:
+
+```bash
+./install.sh --with-helper
+```
+
+If you installed the widget with `omarchy plugin add`, the checkout is
+`~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper`;
+`./install.sh` detects that the plugin is already in place instead of copying
+over it. To install only the helper from any checkout:
+
+```bash
+sudo install -d -m 0755 /usr/lib/chargekeeper
+sudo install -m 0755 -o root -g root lib/chargekeeper-helper \
+  /usr/lib/chargekeeper/chargekeeper-helper
+printf '%s\n' '%wheel ALL=(root) NOPASSWD: /usr/lib/chargekeeper/chargekeeper-helper' \
+  | sudo tee /etc/sudoers.d/chargekeeper >/dev/null
+sudo chmod 0440 /etc/sudoers.d/chargekeeper
+sudo visudo -cf /etc/sudoers.d/chargekeeper
+```
+
+Remove the widget with:
+
+```bash
+omarchy plugin remove io.github.ethandong16.chargekeeper
+```
+
+Then remove the helper and sudoers rule if you installed them:
+
+```bash
+sudo rm -f /etc/sudoers.d/chargekeeper /usr/lib/chargekeeper/chargekeeper-helper
+```
+
+See `docs/omarchy.md` for controls, IPC, settings, and the automation service
+record.
 
 ### Arch Linux package
 
@@ -71,7 +122,7 @@ From the repository root:
 
 `install.sh` never downloads anything and fails if source files are missing.
 It installs the CLI to `~/.local/bin/chargekeeper`, the plugin to
-`~/.config/omarchy/plugins/chargekeeper.omarchy`, units to
+`~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper`, units to
 `~/.config/systemd/user`, and `~/.config/chargekeeper/config.json` if absent.
 
 `--with-helper` installs `/usr/lib/chargekeeper/chargekeeper-helper` (0755
@@ -89,13 +140,20 @@ The timer invokes `chargekeeper auto --once` every minute.
 
 ### Enable the Omarchy widget
 
-`install.sh` places the plugin in the user plugin directory. For a package
-install, copy the shipped source first:
+`install.sh` places the plugin in the user plugin directory:
+
+```bash
+omarchy plugin enable io.github.ethandong16.chargekeeper --section right
+omarchy restart shell
+```
+
+For a package install, copy the shipped source first:
 
 ```bash
 mkdir -p ~/.config/omarchy/plugins
-cp -a /usr/share/chargekeeper/omarchy ~/.config/omarchy/plugins/chargekeeper.omarchy
-omarchy plugin enable chargekeeper.omarchy --section right
+cp -a /usr/share/chargekeeper/omarchy \
+  ~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper
+omarchy plugin enable io.github.ethandong16.chargekeeper --section right
 omarchy restart shell
 ```
 
@@ -248,8 +306,9 @@ answer. It reports what that machine exposes, which may differ from the table.
   exists, and no manual override is active. Inspect with
   `journalctl --user -u chargekeeper-auto`.
 - Omarchy widget missing: run `omarchy plugin validate` on the installed
-  folder, then `omarchy plugin enable chargekeeper.omarchy --section right` and
-  `omarchy restart shell`. Quickshell caches IPC handlers for its lifetime.
+  folder, then
+  `omarchy plugin enable io.github.ethandong16.chargekeeper --section right`,
+  and `omarchy restart shell`. Quickshell caches IPC handlers for its lifetime.
 - Password prompt on every mode change: the `NOPASSWD` rule for `%wheel` is
   absent or not validated. Check `/etc/sudoers.d/chargekeeper` with
   `sudo visudo -cf`.

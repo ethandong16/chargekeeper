@@ -29,11 +29,11 @@ jobs:
 
       - name: Plugin manifest
         run: |
-          jq -e '.schemaVersion == 1' omarchy/manifest.json
-          jq -e '.id == "chargekeeper.omarchy" and .version == "0.1.0"' omarchy/manifest.json
+          jq -e '.schemaVersion == 1' manifest.json
+          jq -e '.id == "io.github.ethandong16.chargekeeper" and .version == "0.1.1"' manifest.json
 
       - name: Plugin tests
-        run: node --test omarchy/tests/*.test.js
+        run: node --test tests/plugin/*.test.js
 
       - name: Tests
         run: bash tests/run.sh

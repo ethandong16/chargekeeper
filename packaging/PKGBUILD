@@ -31,8 +31,10 @@ package() {
   install -Dm755 bin/chargekeeper "$pkgdir/usr/bin/chargekeeper"
   install -Dm755 lib/chargekeeper-helper "$pkgdir/usr/lib/chargekeeper/chargekeeper-helper"
 
-  install -d "$pkgdir/usr/share/chargekeeper"
-  cp -a omarchy "$pkgdir/usr/share/chargekeeper/omarchy"
+  install -d "$pkgdir/usr/share/chargekeeper/omarchy/i18n"
+  install -m0644 manifest.json Panel.qml Service.qml Model.js Policy.js \
+    "$pkgdir/usr/share/chargekeeper/omarchy/"
+  install -m0644 i18n/*.json "$pkgdir/usr/share/chargekeeper/omarchy/i18n/"
 
   install -d "$pkgdir/usr/share/doc/chargekeeper"
   install -m0644 README.md LICENSE CHANGELOG.md "$pkgdir/usr/share/doc/chargekeeper/"
@@ -73,8 +75,9 @@ Enable the automatic policy timer per user:
 
 Omarchy bar plugin (source is /usr/share/chargekeeper/omarchy):
   mkdir -p ~/.config/omarchy/plugins
-  cp -a /usr/share/chargekeeper/omarchy ~/.config/omarchy/plugins/chargekeeper.omarchy
-  omarchy plugin enable chargekeeper.omarchy --section right
+  cp -a /usr/share/chargekeeper/omarchy \
+    ~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper
+  omarchy plugin enable io.github.ethandong16.chargekeeper --section right
 
 Read /usr/share/doc/chargekeeper/README.md and docs/capabilities.md first.
 EOF

@@ -13,8 +13,8 @@ import "Policy.js" as Policy
 // action); Fast needs the small root helper, because UPower has no Fast verb.
 Panel {
   id: root
-  moduleName: "chargekeeper.omarchy"
-  ipcTarget: "chargekeeper.omarchy"
+  moduleName: "io.github.ethandong16.chargekeeper"
+  ipcTarget: "io.github.ethandong16.chargekeeper"
   manageIpc: false
 
   LayoutMirroring.enabled: Commons.I18n.rightToLeft
@@ -313,7 +313,7 @@ Panel {
   }
 
   ShellIpc {
-    target: "chargekeeper.omarchy"
+    target: "io.github.ethandong16.chargekeeper"
 
     function open() { root.open() }
     function close() { root.close() }
