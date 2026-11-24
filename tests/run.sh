@@ -635,5 +635,48 @@ timer=$ROOT/systemd/user/chargekeeper-auto.timer
 if grep -qx 'ExecStart=/usr/bin/chargekeeper auto --once' "$unit"; then pass; else fail "service ExecStart"; fi
 if grep -qx 'WantedBy=timers.target' "$timer"; then pass; else fail "timer WantedBy"; fi
 
+# --- installer: existing directory modes ------------------------------------
+# GNU `install -d -m MODE` also chmods directories that already exist. The
+# installer must create missing directories 0755 but leave existing shared
+# directories such as ~/.config/systemd/user and ~/.config/omarchy/plugins
+# with the mode their owner gave them.
+install_dirs=".local/bin .config/systemd/user .config/chargekeeper .config/omarchy/plugins"
+mkdir -p "$TMP/install-bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/install-bin/systemctl"
+chmod +x "$TMP/install-bin/systemctl"
+
+install_home=$TMP/install-home
+for dir in $install_dirs; do
+  mkdir -p "$install_home/$dir"
+  chmod 0700 "$install_home/$dir"
+done
+HOME=$install_home PATH="$TMP/install-bin:$PATH" "$ROOT/install.sh" \
+  > "$TMP/install.log" 2>&1
+RC=$?
+assert_rc "installer rc" 0
+for dir in $install_dirs; do
+  assert_eq "installer keeps mode of $dir" 700 \
+    "$(stat -c %a "$install_home/$dir" 2>/dev/null)"
+done
+install_sys=$(make_lenovo "$TMP/sys-install")
+OUT=$(env -i PATH="$PATH" HOME="$install_home" \
+  CHARGEKEEPER_SYSFS="$install_sys" \
+  CHARGEKEEPER_CONFIG="$TMP/install-config.json" \
+  CHARGEKEEPER_STATE_DIR="$TMP/install-state" \
+  CHARGEKEEPER_UPOWER=0 \
+  "$install_home/.local/bin/chargekeeper" status 2>&1)
+RC=$?
+assert_rc "installed CLI runs from private bin dir" 0
+
+fresh_home=$TMP/install-fresh
+HOME=$fresh_home PATH="$TMP/install-bin:$PATH" "$ROOT/install.sh" \
+  > "$TMP/install-fresh.log" 2>&1
+RC=$?
+assert_rc "fresh installer rc" 0
+for dir in $install_dirs; do
+  assert_eq "installer creates $dir 0755" 755 \
+    "$(stat -c %a "$fresh_home/$dir" 2>/dev/null)"
+done
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

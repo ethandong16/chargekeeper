@@ -13,6 +13,10 @@ Omarchy Plugin Marketplace preparation. No behavior change in the widget.
   `VERSION` to 0.1.1.
 - `chargekeeper-git` installs the same plugin files to
   `/usr/share/chargekeeper/omarchy`.
+- `install.sh` no longer changes the permissions of directories it did not
+  create. Existing `~/.local/bin`, `~/.config/systemd/user`,
+  `~/.config/chargekeeper`, and `~/.config/omarchy/plugins` keep their modes;
+  missing directories are still created with mode 0755.
 - CI and docs use the new paths and ID. `docs/omarchy.md` describes
   `omarchy plugin add` as the primary install path.
 

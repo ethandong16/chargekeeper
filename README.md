@@ -124,6 +124,8 @@ From the repository root:
 It installs the CLI to `~/.local/bin/chargekeeper`, the plugin to
 `~/.config/omarchy/plugins/io.github.ethandong16.chargekeeper`, units to
 `~/.config/systemd/user`, and `~/.config/chargekeeper/config.json` if absent.
+Missing directories are created with mode 0755; directories that already exist
+keep their current permissions.
 
 `--with-helper` installs `/usr/lib/chargekeeper/chargekeeper-helper` (0755
 root:root) and `/etc/sudoers.d/chargekeeper`, then runs `visudo -cf`. If

@@ -52,6 +52,19 @@ note() {
   printf '%s\n' "$*"
 }
 
+# Create each missing directory with mode 0755, leaving existing directories
+# untouched. GNU `install -d -m` would also chmod directories that already
+# exist, and `mkdir -p -m` only applies the mode to the deepest component.
+ensure_dir() {
+  local dir
+  for dir in "$@"; do
+    if [[ ! -d ${dir} ]]; then
+      mkdir -p -- "${dir}"
+      chmod 0755 -- "${dir}"
+    fi
+  done
+}
+
 while (($# > 0)); do
   case "$1" in
     --with-helper) with_helper=1 ;;
@@ -122,7 +135,7 @@ remove_helper() {
 }
 
 install_user() {
-  install -d -m 0755 \
+  ensure_dir \
     "$(dirname -- "${BIN_DEST}")" \
     "${UNIT_DEST}" \
     "${CONFIG_DIR}" \
@@ -134,7 +147,7 @@ install_user() {
     note "plugin already installed in place: ${PLUGIN_DEST}"
   else
     rm -rf -- "${PLUGIN_DEST}"
-    install -d -m 0755 "${PLUGIN_DEST}" "${PLUGIN_DEST}/i18n"
+    ensure_dir "${PLUGIN_DEST}" "${PLUGIN_DEST}/i18n"
     install -m 0644 \
       "${SRC_DIR}/manifest.json" \
       "${SRC_DIR}/Panel.qml" \
